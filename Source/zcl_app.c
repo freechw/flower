@@ -86,6 +86,8 @@ byte zclApp_TaskID;
  * LOCAL VARIABLES
  */
 
+static uint8 currentSensorsReadingPhase = 0;
+
 afAddrType_t inderect_DstAddr = {.addrMode = (afAddrMode_t)AddrNotPresent, .endPoint = 0, .addr.shortAddr = 0};
 struct bme280_data bme_results;
 struct bme280_dev bme_dev = {.dev_id = BME280_I2C_ADDR_PRIM,
@@ -97,6 +99,8 @@ struct bme280_dev bme_dev = {.dev_id = BME280_I2C_ADDR_PRIM,
  * LOCAL FUNCTIONS
  */
 static void zclApp_HandleKeys(byte shift, byte keys);
+static void zclApp_Report(void);
+
 static void zclApp_ReadSensors(void);
 static void zclApp_InitBME280(struct bme280_dev *dev);
 static void zclApp_ReadBME280(struct bme280_dev *dev);
@@ -179,9 +183,16 @@ uint16 zclApp_event_loop(uint8 task_id, uint16 events) {
 
     if (events & APP_REPORT_EVT) {
         LREPMaster("APP_REPORT_EVT\r\n");
-        zclApp_ReadSensors();
+        zclApp_Report();
         return (events ^ APP_REPORT_EVT);
     }
+
+    if (events & APP_READ_SENSORS_EVT) {
+        LREPMaster("APP_READ_SENSORS_EVT\r\n");
+        zclApp_ReadSensors();
+        return (events ^ APP_READ_SENSORS_EVT);
+    }
+
     // Discard unknown events
     return 0;
 }
@@ -216,27 +227,37 @@ static void zclApp_InitPWM(void) {
 }
 
 static void zclApp_ReadSensors(void) {
-    POWER_ON_SENSORS();
+    LREP("currentSensorsReadingPhase %d\r\n", currentSensorsReadingPhase);
+    /**
+     * FYI: split reading sensors into phases, so single call wouldn't block processor
+     * for extensive ammount of time
+     * */
     HalLedSet(HAL_LED_1, HAL_LED_MODE_BLINK);
-    osal_pwrmgr_task_state(zclApp_TaskID, PWRMGR_HOLD);
+    switch (currentSensorsReadingPhase++) {
+    case 0:
+        POWER_ON_SENSORS();
+        zclApp_ReadLumosity();
+        break;
 
+    case 1:
+        zclBattery_Report();
+        zclApp_ReadSoilHumidity();
+        break;
+    case 2:
+        zclApp_InitBME280(&bme_dev);
+        break;
 
-    zclApp_ReadLumosity();
-
-    zclBattery_Report();
-    zclApp_ReadSoilHumidity();
-
-    zclApp_InitBME280(&bme_dev);
-
-
-
-    zclApp_ReadBME280(&bme_dev);
-
-    osal_pwrmgr_task_state(zclApp_TaskID, PWRMGR_CONSERVE);
-
-    zclApp_ReadDS18B20();
-
-    POWER_OFF_SENSORS();
+    case 3:
+        zclApp_ReadDS18B20();
+        break;
+    default:
+        POWER_OFF_SENSORS();
+        currentSensorsReadingPhase = 0;
+        break;
+    }
+    if (currentSensorsReadingPhase != 0) {
+        osal_start_timerEx(zclApp_TaskID, APP_READ_SENSORS_EVT, 10);
+    }
 }
 
 static void zclApp_ReadSoilHumidity(void) {
@@ -270,7 +291,20 @@ static void zclApp_ReadLumosity(void) {
     LREP("IlluminanceSensor_MeasuredValue value=%d\r\n", zclApp_IlluminanceSensor_MeasuredValue);
 }
 
-void user_delay_ms(uint32_t period) { MicroWait(period * 1000); }
+static void _delay_us(uint16 microSecs) {
+    while (microSecs--) {
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+        asm("NOP");
+    }
+}
+
+void user_delay_ms(uint32_t period) { _delay_us(1000 * period); }
 
 static void zclApp_InitBME280(struct bme280_dev *dev) {
     int8_t rslt = bme280_init(dev);
@@ -292,6 +326,8 @@ static void zclApp_InitBME280(struct bme280_dev *dev) {
 
         uint32_t req_delay = bme280_cal_meas_delay(&dev->settings);
         dev->delay_ms(req_delay);
+
+        zclApp_ReadBME280(dev);
     } else {
         LREP("ReadBME280 init error %d\r\n", rslt);
     }
@@ -311,6 +347,7 @@ static void zclApp_ReadBME280(struct bme280_dev *dev) {
         LREP("ReadBME280 read error %d\r\n", rslt);
     }
 }
+static void zclApp_Report(void) { osal_start_timerEx(zclApp_TaskID, APP_READ_SENSORS_EVT, 10); }
 
 /****************************************************************************
 ****************************************************************************/
